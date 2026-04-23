@@ -1,96 +1,56 @@
-from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, Distance, VectorParams, SparseVectorParams
-from langchain_ollama import OllamaEmbeddings
-from langchain_qdrant import FastEmbedSparse
-from typing import List, Dict, Any
-import asyncio
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams, SparseVectorParams
+from langchain_qdrant import QdrantVectorStore, FastEmbedSparse, RetrievalMode
+from embedding import get_ollama_embedding_model
 from config import settings
+import logging
 
-# Configuration
-COLLECTION_NAME = settings.COLLECTION_NAME
-EMBEDDING_MODEL = settings.EMBEDDING_MODEL
+logger = logging.getLogger(__name__)
 
-async def get_async_qdrant_client():
-    return AsyncQdrantClient(url=settings.QDRANT_HOST)
-
-def get_embeddings():
-    return OllamaEmbeddings(
-        model=EMBEDDING_MODEL,
-        base_url=settings.OLLAMA_BASE_URL
+def get_qdrant_client() -> QdrantClient:
+    """Initialize and return the standard QdrantClient."""
+    return QdrantClient(
+        url=settings.QDRANT_HOST,
+        timeout=30.0,
+        check_compatibility=False
     )
 
-def get_sparse_embeddings():
-    return FastEmbedSparse(model_name="Qdrant/bm25")
+def init_collection(client: QdrantClient):
+    """Ensure the collection exists with correct Hybrid Search configuration."""
+    collections_response = client.get_collections()
+    existing_collections = [c.name for c in collections_response.collections]
+    
+    needs_recreate = False
+    if settings.COLLECTION_NAME in existing_collections:
+        collection_info = client.get_collection(settings.COLLECTION_NAME)
+        if not collection_info.config.params.sparse_vectors or settings.SPARSE_VECTOR_NAME not in collection_info.config.params.sparse_vectors:
+            logger.warning(f"Collection '{settings.COLLECTION_NAME}' is missing sparse vectors. Recreating...")
+            client.delete_collection(settings.COLLECTION_NAME)
+            needs_recreate = True
+    else:
+        needs_recreate = True
 
-async def retrieve_relevant_chunks_hybrid(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Retrieve relevant chunks from Qdrant using Hybrid Search (Dense + Sparse).
-    """
-    client = await get_async_qdrant_client()
-    embeddings = get_embeddings()
-    sparse_embeddings = get_sparse_embeddings()
-    
-    # Generate dense embedding
-    dense_vector = await asyncio.get_event_loop().run_in_executor(
-        None, embeddings.embed_query, query
-    )
-    
-    # Generate sparse embedding
-    sparse_vector = sparse_embeddings.embed_query(query)
-    
-    # Search in Qdrant using hybrid search
-    search_results = await client.query_points(
-        collection_name=COLLECTION_NAME,
-        prefetch=[
-            {
-                "query": dense_vector,
-                "using": "default", # Assuming default is the dense vector name
-                "limit": top_k,
-            },
-            {
-                "query": sparse_vector,
-                "using": "sparse-text",
-                "limit": top_k,
+    if needs_recreate:
+        logger.info(f"Initializing collection '{settings.COLLECTION_NAME}'...")
+        client.create_collection(
+            collection_name=settings.COLLECTION_NAME,
+            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+            sparse_vectors_config={
+                settings.SPARSE_VECTOR_NAME: SparseVectorParams()
             }
-        ],
-        query=None, # In case of RRF or other fusion, but here we can just use prefetch
-        limit=top_k,
-        with_payload=True
+        )
+        logger.info(f"✅ Created collection: {settings.COLLECTION_NAME}")
+    else:
+        logger.info(f"✅ Collection '{settings.COLLECTION_NAME}' is already correctly configured.")
+
+def get_vector_store(client: QdrantClient, embeddings, sparse_embeddings) -> QdrantVectorStore:
+    """Initialize and return the LangChain QdrantVectorStore."""
+    return QdrantVectorStore(
+        client=client,
+        collection_name=settings.COLLECTION_NAME,
+        embedding=embeddings,
+        sparse_embedding=sparse_embeddings,
+        sparse_vector_name=settings.SPARSE_VECTOR_NAME,
+        retrieval_mode=RetrievalMode.HYBRID,
+        validate_collection_config=True # Can re-enable for sync client
     )
-    
-    # Format results
-    relevant_chunks = []
-    for result in search_results.points:
-        chunk_data = {
-            "id": result.id,
-            "score": result.score,
-            "content": result.payload.get("page_content", ""),
-            "metadata": result.payload.get("metadata", {}),
-            "source": result.payload.get("metadata", {}).get("source", "Unknown"),
-            "chunk_index": result.payload.get("metadata", {}).get("chunk_index", 0)
-        }
-        relevant_chunks.append(chunk_data)
-    
-    await client.close()
-    return relevant_chunks
-
-async def print_relevant_chunks(query: str, top_k: int = 5):
-    chunks = await retrieve_relevant_chunks_hybrid(query, top_k)
-    
-    print(f"\n{'='*80}")
-    print(f"QUERY: {query}")
-    print(f"MODE: Hybrid Search (Dense + Sparse)")
-    print(f"{'='*80}\n")
-    
-    for i, chunk in enumerate(chunks, 1):
-        print(f"--- Result #{i} (Score: {chunk['score']:.4f}) ---")
-        print(f"Source: {chunk['source']}")
-        print(f"Chunk Index: {chunk['chunk_index']}")
-        print(f"\nContent:\n{chunk['content']}")
-        print(f"\n{'='*80}\n")
-    
-    return chunks
-
-if __name__ == "__main__":
-    query = "How to add stock (stock inward)?"
-    asyncio.run(print_relevant_chunks(query, top_k=3))

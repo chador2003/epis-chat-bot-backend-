@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from langchain_qdrant import QdrantVectorStore, FastEmbedSparse
 from langchain_core.prompts import ChatPromptTemplate
@@ -17,6 +16,7 @@ from config import settings
 from llm import get_llm
 from embedding import get_ollama_embedding_model
 from ingestion import extract_text, chunk_text, parse_into_documents
+from qdrant import get_qdrant_client, init_collection, get_vector_store
 from fastapi import UploadFile, File, BackgroundTasks
 from qdrant_client.http.models import Distance, VectorParams, SparseVectorParams
 
@@ -40,51 +40,23 @@ async def lifespan(app: FastAPI):
     try:
         app.state.llm = get_llm()
         app.state.ollama_embedding = get_ollama_embedding_model()
-        # Initialize sparse provider for hybrid search
-        app.state.sparse_embedding = FastEmbedSparse(
-            model_name="Qdrant/bm25"
-        )
+        app.state.sparse_embedding = FastEmbedSparse(model_name="Qdrant/bm25")
         logger.info("✅ Models initialized successfully.")
     except Exception as e:
         logger.error(f"❌ Failed to initialize models: {e}")
         sys.exit(1)
 
     try:
-        # Switch to AsyncQdrantClient
-        client = AsyncQdrantClient(
-            url=settings.QDRANT_HOST, 
-            timeout=30.0,
-            check_compatibility=False
+        client = get_qdrant_client()
+        init_collection(client)
+        
+        app.state.vector_store = get_vector_store(
+            client, 
+            app.state.ollama_embedding, 
+            app.state.sparse_embedding
         )
-        
-        collections_response = await client.get_collections()
-        existing_collections = [c.name for c in collections_response.collections]
-        
-        if settings.COLLECTION_NAME not in existing_collections:
-            logger.info(f"Empty/Missing collection. Initializing '{settings.COLLECTION_NAME}' with Hybrid Search support...")
-            
-            await client.create_collection(
-                collection_name=settings.COLLECTION_NAME,
-                vectors_config=VectorParams(size=768, distance=Distance.COSINE),
-                sparse_vectors_config={
-                    "sparse-text": SparseVectorParams()
-                }
-            )
-            logger.info(f"✅ Created new collection with Hybrid Search: {settings.COLLECTION_NAME}")
-        else:
-            logger.info(f"✅ Verified existing Qdrant collection: {settings.COLLECTION_NAME}")
-
-        # Establish the Vector Store with Hybrid Search
-        app.state.vector_store = QdrantVectorStore(
-            async_client=client,
-            collection_name=settings.COLLECTION_NAME,
-            embedding=app.state.ollama_embedding,
-            sparse_embedding=app.state.sparse_embedding,
-            sparse_vector_name="sparse-text",
-            retrieval_mode=QdrantVectorStore.HYBRID
-        )
-        
         app.state.qdrant_client = client
+        logger.info("✅ Qdrant Vector Store initialized.")
 
     except Exception as e:
         logger.error(f"❌ CRITICAL: Qdrant setup failed: {e}")
@@ -92,15 +64,17 @@ async def lifespan(app: FastAPI):
 
     yield
     # Cleanup
-    await app.state.qdrant_client.close()
+    app.state.qdrant_client.close()
     logger.info("Shutting down EPIS Chat API...")
+
+
 
 app = FastAPI(title="EPIS Chat API", lifespan=lifespan)
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://epis.huddymerrabuddy2003.workers.dev"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -151,7 +125,7 @@ async def ingest_pdf(
             # Use async aadd_documents
             await vector_store.aadd_documents(docs)
             
-            count = await request.app.state.qdrant_client.count(
+            count = request.app.state.qdrant_client.count(
                 collection_name=settings.COLLECTION_NAME
             )
             logger.info(f"✅ Ingested {len(docs)} chunks. Collection total: {count.count} vectors")
@@ -180,7 +154,7 @@ async def chat_endpoint(request: Request, chat_request: ChatRequest):
             # Hybrid search is performed by default because we set retrieval_mode=HYBRID
             retrieved_results_with_scores = await vector_store.asimilarity_search_with_score(
                 query_text, 
-                k=int(settings.TOP_K)
+                k=settings.TOP_K
             )
             
         except Exception as e:
@@ -197,15 +171,23 @@ async def chat_endpoint(request: Request, chat_request: ChatRequest):
         if not content_list:
             logger.warning("No relevant context found for query")
             context_text = "No relevant information found in the EPIS documentation."
+            logger.info(f"Final context length: {len(context_text)} characters (0 chunks)")
         else:
-            context_text = "\n\n---\n\n".join(content_list)
-    
-
-        logger.info(f"Context length: {len(context_text)} characters")
-        
-        if len(context_text) > int(settings.MAX_CONTEXT_CHARS):
-            logger.warning(f"Context length ({len(context_text)}) exceeds limit. Truncating.")
-            context_text = context_text[:int(settings.MAX_CONTEXT_CHARS)] + "\n\n[Context truncated for length...]"
+            # Safer truncation: Build context chunk by chunk within the limit
+            context_parts = []
+            current_length = 0
+            for part in content_list:
+                if current_length + len(part) + 5 > settings.MAX_CONTEXT_CHARS:
+                    logger.warning(f"Context limit reached. Truncating remaining {len(content_list) - len(context_parts)} chunks.")
+                    break
+                context_parts.append(part)
+                current_length += len(part) + 5 # +5 for the join separator
+            
+            context_text = "\n\n---\n\n".join(context_parts)
+            if len(context_parts) < len(content_list):
+                 context_text += "\n\n[Context truncated for length...]"
+            
+            logger.info(f"Final context length: {len(context_text)} characters ({len(context_parts)} chunks)")
 
         system_prompt = (
     "You are a specialized assistant for the Bhutan Electronic Patient Information System (EPIS). "
@@ -279,12 +261,12 @@ async def debug_retrieval(request: Request, chat_request: ChatRequest):
 @app.delete("/debug/reset-collection")
 async def reset_collection(request: Request):
     client = request.app.state.qdrant_client
-    await client.delete_collection(settings.COLLECTION_NAME)
-    await client.create_collection(
+    client.delete_collection(settings.COLLECTION_NAME)
+    client.create_collection(
         collection_name=settings.COLLECTION_NAME,
         vectors_config=VectorParams(size=768, distance=Distance.COSINE),
         sparse_vectors_config={
-            "sparse-text": SparseVectorParams()
+            settings.SPARSE_VECTOR_NAME: SparseVectorParams()
         }
     )
     return {"message": "Collection reset. Re-ingest your PDFs with Hybrid Search support."}
