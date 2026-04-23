@@ -1,5 +1,5 @@
 /venv
 .env
 __pycache__
-qdrant_storage
-chat-widget
+/qdrant_storage
+/chat-widget
