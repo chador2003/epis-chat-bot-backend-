@@ -14,4 +14,3 @@ def get_llm():
         base_url=settings.VLLM_BASE_URL,
         temperature=0
     )
-

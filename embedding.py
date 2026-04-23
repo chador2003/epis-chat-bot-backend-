@@ -23,4 +23,3 @@ def get_ollama_embedding_model():
         base_url=settings.OLLAMA_BASE_URL
     )
     return embeddings
-

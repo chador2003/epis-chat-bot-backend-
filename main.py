@@ -7,9 +7,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
-from langchain_qdrant import QdrantVectorStore
+from langchain_qdrant import QdrantVectorStore, FastEmbedSparse
 from langchain_core.prompts import ChatPromptTemplate
 
 # Internal modules
@@ -18,7 +18,7 @@ from llm import get_llm
 from embedding import get_ollama_embedding_model
 from ingestion import extract_text, chunk_text, parse_into_documents
 from fastapi import UploadFile, File, BackgroundTasks
-from qdrant_client.http.models import Distance, VectorParams
+from qdrant_client.http.models import Distance, VectorParams, SparseVectorParams
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,41 +40,50 @@ async def lifespan(app: FastAPI):
     try:
         app.state.llm = get_llm()
         app.state.ollama_embedding = get_ollama_embedding_model()
+        # Initialize sparse provider for hybrid search
+        app.state.sparse_embedding = FastEmbedSparse(
+            model_name="Qdrant/bm25"
+        )
         logger.info("✅ Models initialized successfully.")
     except Exception as e:
         logger.error(f"❌ Failed to initialize models: {e}")
         sys.exit(1)
 
     try:
-        # IMPORTANT: Disable version check to avoid warnings
-        client = QdrantClient(
+        # Switch to AsyncQdrantClient
+        client = AsyncQdrantClient(
             url=settings.QDRANT_HOST, 
             timeout=30.0,
-            check_compatibility=False  # Added this
+            check_compatibility=False
         )
         
-        collections_response = client.get_collections()
+        collections_response = await client.get_collections()
         existing_collections = [c.name for c in collections_response.collections]
         
         if settings.COLLECTION_NAME not in existing_collections:
-            logger.info(f"Empty/Missing collection. Initializing '{settings.COLLECTION_NAME}'...")
+            logger.info(f"Empty/Missing collection. Initializing '{settings.COLLECTION_NAME}' with Hybrid Search support...")
             
-            client.create_collection(
+            await client.create_collection(
                 collection_name=settings.COLLECTION_NAME,
                 vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+                sparse_vectors_config={
+                    "sparse-text": SparseVectorParams()
+                }
             )
-            logger.info(f"✅ Created new collection: {settings.COLLECTION_NAME}")
+            logger.info(f"✅ Created new collection with Hybrid Search: {settings.COLLECTION_NAME}")
         else:
             logger.info(f"✅ Verified existing Qdrant collection: {settings.COLLECTION_NAME}")
 
-        # Establish the Vector Store
+        # Establish the Vector Store with Hybrid Search
         app.state.vector_store = QdrantVectorStore(
-            client=client,
+            async_client=client,
             collection_name=settings.COLLECTION_NAME,
             embedding=app.state.ollama_embedding,
+            sparse_embedding=app.state.sparse_embedding,
+            sparse_vector_name="sparse-text",
+            retrieval_mode=QdrantVectorStore.HYBRID
         )
         
-        # Store client separately for potential direct queries
         app.state.qdrant_client = client
 
     except Exception as e:
@@ -82,6 +91,8 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
 
     yield
+    # Cleanup
+    await app.state.qdrant_client.close()
     logger.info("Shutting down EPIS Chat API...")
 
 app = FastAPI(title="EPIS Chat API", lifespan=lifespan)
@@ -116,13 +127,12 @@ async def generate_llm_stream(llm, full_prompt):
 @app.post("/ingest")
 async def ingest_pdf(
     request: Request,
-    background_tasks: BackgroundTasks,   # ← no default, comes before File()
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Fix 2: use absolute temp path
     temp_path = os.path.join(tempfile.gettempdir(), f"temp_{file.filename}")
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -138,13 +148,10 @@ async def ingest_pdf(
             
             vector_store = request.app.state.vector_store
 
-            # Fix 3: don't block the event loop
-            await asyncio.get_event_loop().run_in_executor(
-                None, vector_store.add_documents, docs
-            )
+            # Use async aadd_documents
+            await vector_store.aadd_documents(docs)
             
-            # Fix 4: verify storage
-            count = request.app.state.qdrant_client.count(
+            count = await request.app.state.qdrant_client.count(
                 collection_name=settings.COLLECTION_NAME
             )
             logger.info(f"✅ Ingested {len(docs)} chunks. Collection total: {count.count} vectors")
@@ -167,35 +174,23 @@ async def chat_endpoint(request: Request, chat_request: ChatRequest):
     try:
         vector_store = request.app.state.vector_store
         llm = request.app.state.llm
-        query_text = f"search_query: {chat_request.query}"
+        query_text = chat_request.query # LangChain handles the search query formatting internally for Hybrid
     
         try:
-            # Use asimilarity_search_with_score to get scores for debugging
+            # Hybrid search is performed by default because we set retrieval_mode=HYBRID
             retrieved_results_with_scores = await vector_store.asimilarity_search_with_score(
                 query_text, 
-                k=settings.TOP_K
+                k=int(settings.TOP_K)
             )
-            
-            # # Log retrieval results for debugging
-            # logger.info(f"Query: '{chat_request.query}'")
-            # for i, (doc, score) in enumerate(retrieved_results_with_scores, 1):
-            #     logger.info(f"  Result {i} - Score: {score:.4f} - Content preview: {doc.page_content[:100]}...")
             
         except Exception as e:
             logger.error(f"Async Retrieval Failed: {e}")
             raise HTTPException(status_code=503, detail="Database unreachable.")
 
-        # Build context from retrieved documents
         content_list = []
         for doc, score in retrieved_results_with_scores:
-            # Optional: Filter by minimum score threshold
-            # if score < 0.5:  # Adjust threshold as needed
-            #     continue
-            
             text_content = doc.page_content
             source = doc.metadata.get("source", "Unknown")
-            
-            # Format with source information
             formatted_content = f"[Source: {source}]\n{text_content}"
             content_list.append(formatted_content)
 
@@ -210,7 +205,7 @@ async def chat_endpoint(request: Request, chat_request: ChatRequest):
         
         if len(context_text) > int(settings.MAX_CONTEXT_CHARS):
             logger.warning(f"Context length ({len(context_text)}) exceeds limit. Truncating.")
-            context_text = context_text[:settings.MAX_CONTEXT_CHARS] + "\n\n[Context truncated for length...]"
+            context_text = context_text[:int(settings.MAX_CONTEXT_CHARS)] + "\n\n[Context truncated for length...]"
 
         system_prompt = (
     "You are a specialized assistant for the Bhutan Electronic Patient Information System (EPIS). "
@@ -248,10 +243,9 @@ async def chat_endpoint(request: Request, chat_request: ChatRequest):
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
-# DEBUG ENDPOINT - Remove in production
 @app.post("/debug/test-retrieval")
 async def debug_retrieval(request: Request, chat_request: ChatRequest):
-    """Debug endpoint to test chunk retrieval and see scores"""
+    """Debug endpoint to test chunk retrieval and see scores with Hybrid Search"""
     try:
         vector_store = request.app.state.vector_store
         
@@ -273,6 +267,7 @@ async def debug_retrieval(request: Request, chat_request: ChatRequest):
         
         return {
             "query": chat_request.query,
+            "retrieval_mode": "hybrid",
             "total_results": len(results),
             "results": results
         }
@@ -284,12 +279,15 @@ async def debug_retrieval(request: Request, chat_request: ChatRequest):
 @app.delete("/debug/reset-collection")
 async def reset_collection(request: Request):
     client = request.app.state.qdrant_client
-    client.delete_collection(settings.COLLECTION_NAME)
-    client.create_collection(
+    await client.delete_collection(settings.COLLECTION_NAME)
+    await client.create_collection(
         collection_name=settings.COLLECTION_NAME,
         vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        sparse_vectors_config={
+            "sparse-text": SparseVectorParams()
+        }
     )
-    return {"message": "Collection reset. Re-ingest your PDFs."}
+    return {"message": "Collection reset. Re-ingest your PDFs with Hybrid Search support."}
 
 if __name__ == "__main__":
     import uvicorn
