@@ -1,0 +1,16 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: db_epis
+    ports:
+      - "6333:6333" # HTTP API & Dashboard
+      - "6334:6334" # gRPC API (Used by many Vector DB clients)
+    environment:
+      # This fixes the "Unrecognized filesystem" error on Windows/WSL2
+      - QDRANT__STORAGE__PERFORMANCE__HANDLE_FS_ERRORS=true
+      # Optional: set a limited log level to keep your terminal clean
+      - QDRANT__LOG_LEVEL=INFO
+    volumes:
+      # On Windows, ensure this folder exists in your project directory
+      - ./qdrant_storage:/qdrant/storage:z
+    restart: always

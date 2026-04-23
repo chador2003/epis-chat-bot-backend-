@@ -33,19 +33,6 @@ def extract_text(file_path):
     return full_text
 
 def chunk_text(llm, text, max_chunk_size=8000):    
-    # if len(text) > max_chunk_size:
-    #     logger.info(f"Text size ({len(text)}) exceeds limit. Splitting into parts...")
-        
-    #     # Split text into two halves (or more if needed)
-    #     mid = len(text) // 2
-    #     part1 = text[:mid]
-    #     part2 = text[mid:]
-        
-    #     # Recursively process both parts and join them
-    #     res1 = chunk_text(llm, part1, max_chunk_size)
-    #     res2 = chunk_text(llm, part2, max_chunk_size)
-        
-    #     return f"{res1}\n===CHUNK_BOUNDARY===\n{res2}"
 
     prompt = f"""
     You are a data processing assistant specialized in content segmentation.

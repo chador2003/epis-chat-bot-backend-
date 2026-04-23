@@ -20,6 +20,11 @@ from ingestion import extract_text, chunk_text, parse_into_documents
 from fastapi import UploadFile, File, BackgroundTasks
 from qdrant_client.http.models import Distance, VectorParams
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import tempfile
+
 # Configure Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +46,12 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
 
     try:
-        client = QdrantClient(url=settings.QDRANT_HOST, timeout=30.0)
+        # IMPORTANT: Disable version check to avoid warnings
+        client = QdrantClient(
+            url=settings.QDRANT_HOST, 
+            timeout=30.0,
+            check_compatibility=False  # Added this
+        )
         
         collections_response = client.get_collections()
         existing_collections = [c.name for c in collections_response.collections]
@@ -63,6 +73,9 @@ async def lifespan(app: FastAPI):
             collection_name=settings.COLLECTION_NAME,
             embedding=app.state.ollama_embedding,
         )
+        
+        # Store client separately for potential direct queries
+        app.state.qdrant_client = client
 
     except Exception as e:
         logger.error(f"❌ CRITICAL: Qdrant setup failed: {e}")
@@ -73,9 +86,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EPIS Chat API", lifespan=lifespan)
 
-class ChatRequest(BaseModel):
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    # ... Field is required
+class ChatRequest(BaseModel):
     query: str = Field(
         ..., 
         min_length=1, 
@@ -94,16 +114,16 @@ async def generate_llm_stream(llm, full_prompt):
         yield "\n\n[ERROR: The AI generation was interrupted.]"
 
 @app.post("/ingest")
-
 async def ingest_pdf(
-    request: Request, 
+    request: Request,
+    background_tasks: BackgroundTasks,   # ← no default, comes before File()
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    temp_path = f"temp_{file.filename}"
+    # Fix 2: use absolute temp path
+    temp_path = os.path.join(tempfile.gettempdir(), f"temp_{file.filename}")
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -112,26 +132,29 @@ async def ingest_pdf(
             logger.info(f"Started background ingestion for {file.filename}")
            
             raw_text = extract_text(temp_path)
-            
             llm = request.app.state.llm
-            structured_text =  chunk_text(llm, raw_text)
-            
+            structured_text = chunk_text(llm, raw_text)
             docs = parse_into_documents(structured_text, file.filename)
             
             vector_store = request.app.state.vector_store
-        
-            vector_store.add_documents(docs)
+
+            # Fix 3: don't block the event loop
+            await asyncio.get_event_loop().run_in_executor(
+                None, vector_store.add_documents, docs
+            )
             
-            logger.info(f"✅ Successfully ingested {len(docs)} chunks from {file.filename}")
+            # Fix 4: verify storage
+            count = request.app.state.qdrant_client.count(
+                collection_name=settings.COLLECTION_NAME
+            )
+            logger.info(f"✅ Ingested {len(docs)} chunks. Collection total: {count.count} vectors")
             
         except Exception as e:
-            logger.error(f"❌ Ingestion failed for {file.filename}: {e}")
+            logger.error(f"❌ Ingestion failed for {file.filename}: {e}", exc_info=True)
         finally:
-            # Always clean up the temp file
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    # 4. Run the heavy processing in the background
     background_tasks.add_task(process_and_cleanup)
 
     return {
@@ -144,58 +167,130 @@ async def chat_endpoint(request: Request, chat_request: ChatRequest):
     try:
         vector_store = request.app.state.vector_store
         llm = request.app.state.llm
-
+        query_text = f"search_query: {chat_request.query}"
+    
         try:
-            # We use await here to let other requests process while we wait for Qdrant
-            retrieved_results = await vector_store.asimilarity_search(
-                chat_request.query, 
+            # Use asimilarity_search_with_score to get scores for debugging
+            retrieved_results_with_scores = await vector_store.asimilarity_search_with_score(
+                query_text, 
                 k=settings.TOP_K
             )
-
-            print(retrieved_results)
+            
+            # # Log retrieval results for debugging
+            # logger.info(f"Query: '{chat_request.query}'")
+            # for i, (doc, score) in enumerate(retrieved_results_with_scores, 1):
+            #     logger.info(f"  Result {i} - Score: {score:.4f} - Content preview: {doc.page_content[:100]}...")
             
         except Exception as e:
             logger.error(f"Async Retrieval Failed: {e}")
             raise HTTPException(status_code=503, detail="Database unreachable.")
 
+        # Build context from retrieved documents
         content_list = []
-        for doc in retrieved_results:
+        for doc, score in retrieved_results_with_scores:
+            # Optional: Filter by minimum score threshold
+            # if score < 0.5:  # Adjust threshold as needed
+            #     continue
+            
             text_content = doc.page_content
-            content_list.append(text_content)
+            source = doc.metadata.get("source", "Unknown")
+            
+            # Format with source information
+            formatted_content = f"[Source: {source}]\n{text_content}"
+            content_list.append(formatted_content)
 
-        context_text = "\n\n".join(content_list)
+        if not content_list:
+            logger.warning("No relevant context found for query")
+            context_text = "No relevant information found in the EPIS documentation."
+        else:
+            context_text = "\n\n---\n\n".join(content_list)
+    
+
+        logger.info(f"Context length: {len(context_text)} characters")
         
         if len(context_text) > int(settings.MAX_CONTEXT_CHARS):
             logger.warning(f"Context length ({len(context_text)}) exceeds limit. Truncating.")
             context_text = context_text[:settings.MAX_CONTEXT_CHARS] + "\n\n[Context truncated for length...]"
 
-        #Prompt Hardening with XML tags
         system_prompt = (
-            "You are a specialized assistant for the Bhutan EPIS. "
-            "Answer the question based ONLY on the provided context inside the XML tags. "
-            "If the answer is not in the context, say you do not know."
-        )
+    "You are a specialized assistant for the Bhutan Electronic Patient Information System (EPIS). "
+    "Your role is to help healthcare professionals navigate and use the EPIS system effectively.\n\n"
+    "Guidelines:\n"
+    "1. If the user sends a greeting (e.g., 'Hi', 'Hello', 'Kuzuzangpo'), greet them back warmly and professionally before addressing their query.\n"
+    "2. Answer technical questions based ONLY on the provided context within the <context> tags.\n"
+    "3. Provide step-by-step instructions when explaining procedures.\n"
+    "4. If the answer is not in the context, clearly state 'Sorry I don't have that information in the EPIS documentation'.\n"
+    "5. Be concise and professional.\n"
+    "6. Use the exact terminology from the documentation.\n"
+    "7. Format steps clearly with numbering when appropriate."
+)
         
         prompt_template = ChatPromptTemplate([
             ("system", system_prompt),
-            ("user", "Context:\n<context>\n{context}\n</context>\n\nQuestion: {question}")
+            ("user", "Context:\n<context>\n{context}\n</context>\n\nQuestion: {question}\n\nAnswer:")
         ])
 
         full_prompt = prompt_template.format_messages(
             context=context_text,
             question=chat_request.query
         )
-        return StreamingResponse(
+
+        response = StreamingResponse(
             generate_llm_stream(llm, full_prompt), 
             media_type="text/plain"
         )
-
+        return response
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error in Chat Endpoint: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
+# DEBUG ENDPOINT - Remove in production
+@app.post("/debug/test-retrieval")
+async def debug_retrieval(request: Request, chat_request: ChatRequest):
+    """Debug endpoint to test chunk retrieval and see scores"""
+    try:
+        vector_store = request.app.state.vector_store
+        
+        retrieved_results = await vector_store.asimilarity_search_with_score(
+            chat_request.query,
+            k=10 
+        )
+        
+        results = []
+        for i, (doc, score) in enumerate(retrieved_results, 1):
+            results.append({
+                "rank": i,
+                "score": float(score),
+                "source": doc.metadata.get("source", "Unknown"),
+                "chunk_index": doc.metadata.get("chunk_index", "N/A"),
+                "content_preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                "full_content": doc.page_content
+            })
+        
+        return {
+            "query": chat_request.query,
+            "total_results": len(results),
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/debug/reset-collection")
+async def reset_collection(request: Request):
+    client = request.app.state.qdrant_client
+    client.delete_collection(settings.COLLECTION_NAME)
+    client.create_collection(
+        collection_name=settings.COLLECTION_NAME,
+        vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+    )
+    return {"message": "Collection reset. Re-ingest your PDFs."}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8004)
+    uvicorn.run(app, host="0.0.0.0", port=9000)
