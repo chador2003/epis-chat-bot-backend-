@@ -1,7 +1,7 @@
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, AsyncQdrantClient
 from qdrant_client.http.models import Distance, VectorParams, SparseVectorParams
 from langchain_qdrant import QdrantVectorStore, FastEmbedSparse, RetrievalMode
-from embedding import get_ollama_embedding_model
+from core.embedding import get_ollama_embedding_model
 from config import settings
 import logging
 
@@ -10,6 +10,14 @@ logger = logging.getLogger(__name__)
 def get_qdrant_client() -> QdrantClient:
     """Initialize and return the standard QdrantClient."""
     return QdrantClient(
+        url=settings.QDRANT_HOST,
+        timeout=30.0,
+        check_compatibility=False
+    )
+
+def get_async_qdrant_client() -> AsyncQdrantClient:
+    """Initialize and return the AsyncQdrantClient."""
+    return AsyncQdrantClient(
         url=settings.QDRANT_HOST,
         timeout=30.0,
         check_compatibility=False
@@ -52,5 +60,5 @@ def get_vector_store(client: QdrantClient, embeddings, sparse_embeddings) -> Qdr
         sparse_embedding=sparse_embeddings,
         sparse_vector_name=settings.SPARSE_VECTOR_NAME,
         retrieval_mode=RetrievalMode.HYBRID,
-        validate_collection_config=True # Can re-enable for sync client
+        validate_collection_config=True
     )

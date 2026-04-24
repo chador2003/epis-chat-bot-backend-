@@ -1,9 +1,9 @@
 import asyncio
 from langchain_core.documents import Document
-from langchain_qdrant import QdrantVectorStore, FastEmbedSparse
+from langchain_qdrant import QdrantVectorStore, FastEmbedSparseProvider
 from qdrant_client import AsyncQdrantClient
 from config import settings
-from embedding import get_ollama_embedding_model
+from core.embedding import get_ollama_embedding_model
 
 async def manual_ingest_chunk(text: str, source: str = "manual_entry", metadata: dict = None):
     """
@@ -13,15 +13,7 @@ async def manual_ingest_chunk(text: str, source: str = "manual_entry", metadata:
     
     # 1. Initialize Models (Matches main.py)
     dense_embeddings = get_ollama_embedding_model()
-    try:
-        sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
-    except ImportError:
-        print("❌ Error: 'fastembed' package not found in the current environment.")
-        print("Please run: pip install fastembed")
-        return
-    except Exception as e:
-        print(f"❌ Error initializing Sparse Embeddings: {e}")
-        return
+    sparse_embeddings = FastEmbedSparseProvider(model_name="Qdrant/bm25")
     
     # 2. Initialize Async Client
     client = AsyncQdrantClient(
@@ -67,13 +59,21 @@ async def manual_ingest_chunk(text: str, source: str = "manual_entry", metadata:
 if __name__ == "__main__":
     # --- CONFIGURE YOUR CHUNK HERE ---
     text_to_ingest = """
-    Q: How do I access the EPIS dashboard?
-    A: To access the EPIS dashboard, log in with your credentials at https://epis.gov.bt and 
-    click on the 'Dashboard' icon on the left sidebar.
+        Q. How to Upload Supporting Documents in Grievance Registration?
+        A. To upload supporting documents in Grievance Registration, follow these steps:
+            1. Click the Choose File button.
+            2. Select the required file from your computer.
+            3. Click Add to upload document.
+            4. Click View Documents to verify the uploaded files.
+            Supporting documents may include:
+            * Photos
+            * PDF files
+            * Other relevant evidence.
+    
     """
     
     metadata = {
-        "category": "navigation",
+        "category": "grievance_management",
         "importance": "high"
     }
     
