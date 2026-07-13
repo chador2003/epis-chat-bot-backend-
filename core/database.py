@@ -24,32 +24,37 @@ def get_async_qdrant_client() -> AsyncQdrantClient:
     )
 
 def init_collection(client: QdrantClient):
-    """Ensure the collection exists with correct Hybrid Search configuration."""
+    """Ensure the collection exists with correct Hybrid Search configuration.
+
+    Never deletes an existing collection: if the config is wrong, we raise
+    so ingested data is not silently destroyed.
+    """
     collections_response = client.get_collections()
     existing_collections = [c.name for c in collections_response.collections]
-    
-    needs_recreate = False
+
     if settings.COLLECTION_NAME in existing_collections:
         collection_info = client.get_collection(settings.COLLECTION_NAME)
-        if not collection_info.config.params.sparse_vectors or settings.SPARSE_VECTOR_NAME not in collection_info.config.params.sparse_vectors:
-            logger.warning(f"Collection '{settings.COLLECTION_NAME}' is missing sparse vectors. Recreating...")
-            client.delete_collection(settings.COLLECTION_NAME)
-            needs_recreate = True
-    else:
-        needs_recreate = True
-
-    if needs_recreate:
-        logger.info(f"Initializing collection '{settings.COLLECTION_NAME}'...")
-        client.create_collection(
-            collection_name=settings.COLLECTION_NAME,
-            vectors_config=VectorParams(size=768, distance=Distance.COSINE),
-            sparse_vectors_config={
-                settings.SPARSE_VECTOR_NAME: SparseVectorParams()
-            }
-        )
-        logger.info(f"✅ Created collection: {settings.COLLECTION_NAME}")
-    else:
+        sparse_vectors = collection_info.config.params.sparse_vectors
+        if not sparse_vectors or settings.SPARSE_VECTOR_NAME not in sparse_vectors:
+            raise RuntimeError(
+                f"Collection '{settings.COLLECTION_NAME}' exists but is missing the "
+                f"sparse vector '{settings.SPARSE_VECTOR_NAME}' required for hybrid search. "
+                f"Refusing to auto-delete it. If you really want to recreate it, delete it "
+                f"manually first, e.g.:\n"
+                f"  curl -X DELETE {settings.QDRANT_HOST}/collections/{settings.COLLECTION_NAME}"
+            )
         logger.info(f"✅ Collection '{settings.COLLECTION_NAME}' is already correctly configured.")
+        return
+
+    logger.info(f"Initializing collection '{settings.COLLECTION_NAME}'...")
+    client.create_collection(
+        collection_name=settings.COLLECTION_NAME,
+        vectors_config=VectorParams(size=768, distance=Distance.COSINE),
+        sparse_vectors_config={
+            settings.SPARSE_VECTOR_NAME: SparseVectorParams()
+        }
+    )
+    logger.info(f"✅ Created collection: {settings.COLLECTION_NAME}")
 
 def get_vector_store(client: QdrantClient, embeddings, sparse_embeddings) -> QdrantVectorStore:
     """Initialize and return the LangChain QdrantVectorStore."""

@@ -43,8 +43,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--url",
-        default="http://localhost:9000/chat",
-        help="Chat endpoint URL (default: http://localhost:9000/chat)",
+        default="http://172.19.9.235:9000/chat",
+        help="Chat endpoint URL (default: http://172.19.9.235:9000/chat)",
     )
     parser.add_argument(
         "--client-id",

@@ -1,9 +1,16 @@
 import logging
 from fastapi.responses import StreamingResponse
 from langchain_core.prompts import ChatPromptTemplate
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+class DatabaseUnreachableError(Exception):
+    """Qdrant could not be reached or returned an error."""
+
+class EmbeddingServiceError(Exception):
+    """Query embedding failed (Ollama down, model missing, etc.)."""
 
 async def generate_llm_stream(llm, full_prompt):
     try:
@@ -19,13 +26,18 @@ async def get_chat_response(vector_store, llm, query_text):
     try:
         # Hybrid search is performed by default because we set retrieval_mode=HYBRID
         retrieved_results_with_scores = await vector_store.asimilarity_search_with_score(
-            query_text, 
+            query_text,
             k=settings.TOP_K
         )
-        
+
+    except (ResponseHandlingException, UnexpectedResponse) as e:
+        logger.error(f"Qdrant retrieval failed: {e}")
+        raise DatabaseUnreachableError("Database unreachable.") from e
     except Exception as e:
-        logger.error(f"Async Retrieval Failed: {e}")
-        raise Exception("Database unreachable.")
+        # Anything else at this stage is almost always the embedding step
+        # (Ollama not running, embedding model not pulled, timeout).
+        logger.error(f"Retrieval failed before/during embedding (check Ollama): {e}")
+        raise EmbeddingServiceError("Embedding service unavailable.") from e
 
     content_list = []
     for doc, score in retrieved_results_with_scores:
@@ -47,11 +59,11 @@ async def get_chat_response(vector_store, llm, query_text):
                 break
             context_parts.append(part)
             current_length += len(part) + 5 # +5 for the join separator
-        
+
         context_text = "\n\n---\n\n".join(context_parts)
         if len(context_parts) < len(content_list):
              context_text += "\n\n[Context truncated for length...]"
-        
+
         logger.info(f"Final context length: {len(context_text)} characters ({len(context_parts)} chunks)")
 
     system_prompt = (
@@ -66,7 +78,7 @@ async def get_chat_response(vector_store, llm, query_text):
         "6. Use the exact terminology from the documentation.\n"
         "7. Format steps clearly with numbering when appropriate."
     )
-    
+
     prompt_template = ChatPromptTemplate([
         ("system", system_prompt),
         ("user", "Context:\n<context>\n{context}\n</context>\n\nQuestion: {question}\n\nAnswer:")
@@ -78,6 +90,6 @@ async def get_chat_response(vector_store, llm, query_text):
     )
 
     return StreamingResponse(
-        generate_llm_stream(llm, full_prompt), 
+        generate_llm_stream(llm, full_prompt),
         media_type="text/plain"
     )
